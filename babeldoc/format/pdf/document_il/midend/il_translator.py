@@ -47,6 +47,22 @@ from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecu
 logger = logging.getLogger(__name__)
 
 
+_PLAIN_RICH_TEXT_RE = re.compile(
+    r"^[A-Za-z0-9\s.,;:!?()\[\]{}<>\"'/\\+\-=–—‑%&:^]+$",
+)
+
+
+def _looks_like_plain_inline_text(chars) -> bool:
+    """Treat styled Latin/digit runs in prose as translatable text, not rich placeholders."""
+    text = get_char_unicode_string(chars)
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if not any(ch.isalnum() for ch in stripped):
+        return False
+    return bool(_PLAIN_RICH_TEXT_RE.fullmatch(stripped))
+
+
 PROMPT_TEMPLATE = Template(
     """$role_block
 
@@ -662,6 +678,12 @@ class ILTranslator:
             elif composition.pdf_same_style_characters:
                 if disable_rich_text_translate:
                     # 如果禁用富文本翻译，直接添加字符
+                    chars.extend(composition.pdf_same_style_characters.pdf_character)
+                    continue
+
+                if _looks_like_plain_inline_text(
+                    composition.pdf_same_style_characters.pdf_character,
+                ):
                     chars.extend(composition.pdf_same_style_characters.pdf_character)
                     continue
 
