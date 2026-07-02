@@ -836,31 +836,6 @@ class PDFCreater:
             return chars
         return chars
 
-    def get_char_union_box(
-        self,
-        chars: list[il_version_1.PdfCharacter],
-    ):
-        visible_chars = [
-            char
-            for char in chars
-            if char.char_unicode not in ("\n",) and char.box is not None
-        ]
-        if not visible_chars:
-            return None
-        return (
-            min(char.box.x for char in visible_chars) - 1.0,
-            min(char.box.y for char in visible_chars) - 1.0,
-            max(char.box.x2 for char in visible_chars) + 1.0,
-            max(char.box.y2 for char in visible_chars) + 1.0,
-        )
-
-    @staticmethod
-    def box_contains_point(box, x: float, y: float) -> bool:
-        if box is None:
-            return False
-        x1, y1, x2, y2 = box
-        return x1 <= x <= x2 and y1 <= y <= y2
-
     def create_render_units_for_page(
         self,
         page: il_version_1.Page,
@@ -871,28 +846,10 @@ class PDFCreater:
 
         # Collect all characters (from page and paragraphs)
         chars = []
-        paragraph_chars_list = []
-        paragraph_boxes = []
-        for paragraph in page.pdf_paragraph:
-            paragraph_chars = self.render_paragraph_to_char(paragraph)
-            paragraph_chars_list.append(paragraph_chars)
-            paragraph_boxes.append(self.get_char_union_box(paragraph_chars))
-
         if page.pdf_character:
-            for char in page.pdf_character:
-                if char.box is None:
-                    chars.append(char)
-                    continue
-                cx = (char.box.x + char.box.x2) / 2
-                cy = (char.box.y + char.box.y2) / 2
-                if any(
-                    self.box_contains_point(box, cx, cy)
-                    for box in paragraph_boxes
-                ):
-                    continue
-                chars.append(char)
-        for paragraph_chars in paragraph_chars_list:
-            chars.extend(paragraph_chars)
+            chars.extend(page.pdf_character)
+        for paragraph in page.pdf_paragraph:
+            chars.extend(self.render_paragraph_to_char(paragraph))
 
         # Convert characters to render units
         for i, char in enumerate(chars):

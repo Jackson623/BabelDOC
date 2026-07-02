@@ -1,4 +1,3 @@
-from copy import copy
 import math
 import re
 
@@ -639,9 +638,7 @@ class StylesAndFormulas:
                 ):
                     # 将可翻译公式转换为普通文本行
                     new_line = PdfLine(
-                        pdf_character=self.normalize_translatable_formula_characters(
-                            composition.pdf_formula,
-                        ),
+                        pdf_character=composition.pdf_formula.pdf_character,
                     )
                     self.update_line_data(new_line)
                     new_compositions.append(PdfParagraphComposition(pdf_line=new_line))
@@ -649,40 +646,6 @@ class StylesAndFormulas:
                     new_compositions.append(composition)
 
             paragraph.pdf_paragraph_composition = new_compositions
-
-    def normalize_translatable_formula_characters(
-        self,
-        formula: PdfFormula,
-    ) -> list[PdfCharacter]:
-        chars = formula.pdf_character
-        if not chars:
-            return chars
-
-        font_sizes = [
-            char.pdf_style.font_size
-            for char in chars
-            if char.pdf_style and char.pdf_style.font_size
-        ]
-        if not font_sizes:
-            return chars
-
-        base_size = max(font_sizes)
-        result = []
-        in_superscript = False
-        for char in chars:
-            new_char = copy(char)
-            text = new_char.char_unicode or ""
-            is_superscript = (
-                text.isdigit()
-                and new_char.pdf_style
-                and new_char.pdf_style.font_size
-                and new_char.pdf_style.font_size < base_size * 0.85
-            )
-            if is_superscript and not in_superscript and result:
-                new_char.char_unicode = "^" + text
-            in_superscript = is_superscript
-            result.append(new_char)
-        return result
 
     def process_page_styles(self, page: Page):
         """处理页面中的文本样式，识别相同样式的文本"""
@@ -985,13 +948,11 @@ class StylesAndFormulas:
             return PdfParagraphComposition(pdf_line=new_line)
 
     def is_translatable_formula(self, formula: PdfFormula) -> bool:
-        """判断公式是否只包含需要正常翻译的字符（数字、符号、空格和英文逗号）"""
+        """判断公式是否只包含需要正常翻译的字符（数字、空格和英文逗号）"""
         if all(char.formula_layout_id for char in formula.pdf_character):
             return False
 
         text = "".join(char.char_unicode for char in formula.pdf_character)
-        if bool(re.match(r"^[+\-−–—�C0-9,.\s]+$", text)):
-            return True
         if formula.y_offset > 0.1:
             return False
         return bool(re.match(r"^[0-9, .]+$", text))
