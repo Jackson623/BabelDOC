@@ -771,8 +771,13 @@ class ILTranslator:
 
         text = re.sub(r"\s+", " ", paragraph.unicode or "").strip()
         text = re.sub(r"(?P<chapter>\d+)-\s+(?P<page>\d+)", r"\g<chapter>-\g<page>", text)
+        toc_prefix = (
+            r"(?:\.?\d+(?:\.\d+)*|"
+            r"[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){0,4}"
+            r"\s+\d+(?:[-.]\d+)*\.?)"
+        )
         match = re.match(
-            r"^(?P<number>\.?\d+(?:\.\d+)*)\s+"
+            rf"^(?P<prefix>{toc_prefix})\s+"
             r"(?P<title>.*?)"
             r"(?P<leader>(?:\.\s*)+)\s*"
             r"(?P<page>\d+\s*-\s*\d*|\d+)"
@@ -786,7 +791,7 @@ class ILTranslator:
         if not title:
             return None
 
-        prefix = f"{match.group('number')} "
+        prefix = f"{match.group('prefix')} "
         dot_count = match.group("leader").count(".")
         leader = "." * max(24, min(dot_count, 120))
         page = re.sub(r"\s+", "", match.group("page"))
@@ -809,6 +814,9 @@ class ILTranslator:
                 text,
             )
             paragraph.unicode = text
+
+            if self._repair_labeled_toc_unicode_prefix(paragraphs, index):
+                continue
 
             if self._merge_toc_page_tail(paragraphs, index):
                 continue
@@ -848,6 +856,45 @@ class ILTranslator:
             if clean_match:
                 previous_number = clean_match.group("number")
             index += 1
+
+    @staticmethod
+    def _repair_labeled_toc_unicode_prefix(
+        paragraphs: list[PdfParagraph],
+        index: int,
+    ) -> bool:
+        if index + 1 >= len(paragraphs):
+            return False
+
+        current = paragraphs[index]
+        next_paragraph = paragraphs[index + 1]
+        current_text = re.sub(r"\s+", " ", current.unicode or "").strip()
+        next_text = re.sub(r"\s+", " ", next_paragraph.unicode or "").strip()
+        current_match = re.search(
+            r"(?P<body>.*?(?:\d+-\d+|-?\d+))\s+"
+            r"(?P<prefix>[A-Z][A-Za-z]{0,8})$",
+            current_text,
+        )
+        if not current_match:
+            return False
+
+        next_match = re.match(
+            r"(?P<rest>[a-z][A-Za-z]*\s+\d+(?:[-.]\d+)*\.?\s+)",
+            next_text,
+        )
+        if not next_match:
+            return False
+
+        combined_prefix = current_match.group("prefix") + next_match.group("rest")
+        if not re.match(
+            r"[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){0,4}"
+            r"\s+\d+(?:[-.]\d+)*\.?\s+",
+            combined_prefix,
+        ):
+            return False
+
+        current.unicode = current_match.group("body")
+        next_paragraph.unicode = current_match.group("prefix") + next_text
+        return True
 
     def _merge_toc_page_tail(
         self,

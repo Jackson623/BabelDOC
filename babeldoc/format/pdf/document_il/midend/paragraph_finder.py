@@ -316,6 +316,8 @@ class ParagraphFinder:
             page.pdf_character = []
 
         self.fix_overlapping_paragraphs(page)
+        self.repair_toc_split_fragments(page.pdf_paragraph)
+        self.repair_labeled_toc_prefix_fragments(page.pdf_paragraph)
         self.repair_toc_unicode_fragments(page.pdf_paragraph)
 
         # 第六步：对每一行的字符进行排序
@@ -1228,6 +1230,15 @@ class ParagraphFinder:
     def _has_toc_dot_leader(text: str) -> bool:
         return re.search(r"(?:\.\s*){20,}", text) is not None
 
+    @staticmethod
+    def _toc_entry_prefix_pattern() -> str:
+        numeric_prefix = r"\d+(?:\.\d+)+"
+        labeled_prefix = (
+            r"[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){0,4}"
+            r"\s+\d+(?:[-.]\d+)*\.?"
+        )
+        return rf"(?:{numeric_prefix}|{labeled_prefix})\s+"
+
     def split_toc_entry_paragraphs(self, paragraphs: list[PdfParagraph]):
         new_paragraphs: list[PdfParagraph] = []
         for paragraph in paragraphs:
@@ -1280,7 +1291,8 @@ class ParagraphFinder:
         split_offsets = [
             match.start("next")
             for match in re.finditer(
-                r"(?<![-\d])(?P<page>\d+-\d+|\d+)\s+(?P<next>\d+(?:\.\d+)+\s+)",
+                rf"(?<![-\d])(?P<page>\d+-\d+|\d+)\s+"
+                rf"(?P<next>{self._toc_entry_prefix_pattern()})",
                 text,
             )
         ]
@@ -1332,7 +1344,8 @@ class ParagraphFinder:
                 continue
 
             match = re.match(
-                r"(?:\.\s*)?(?P<fragment>\d+-\d+|-?\d+)\s+(?P<next>\d+(?:\.\d+)+\s+)",
+                rf"(?:\.\s*)?(?P<fragment>\d+-\d+|-?\d+)\s+"
+                rf"(?P<next>{self._toc_entry_prefix_pattern()})",
                 current_text,
             )
             if not match:
@@ -1401,6 +1414,17 @@ class ParagraphFinder:
                     current_text,
                 ):
                     changed = True
+                    continue
+
+                if self._move_trailing_labeled_toc_prefix_to_current(
+                    previous,
+                    previous_line,
+                    previous_text,
+                    current,
+                    current_line,
+                    current_text,
+                ):
+                    changed = True
 
     def merge_isolated_toc_page_tails(self, paragraphs: list[PdfParagraph]):
         index = 1
@@ -1435,6 +1459,32 @@ class ParagraphFinder:
             self.update_line_data(previous_line)
             self.update_paragraph_data(previous, update_unicode=True)
             del paragraphs[index]
+
+    def repair_labeled_toc_prefix_fragments(self, paragraphs: list[PdfParagraph]):
+        for index in range(1, len(paragraphs)):
+            previous = paragraphs[index - 1]
+            current = paragraphs[index]
+            previous_line = self._get_last_line(previous)
+            current_line = self._get_first_line(current)
+            if not previous_line or not current_line:
+                continue
+
+            previous_text = get_char_unicode_string(previous_line.pdf_character)
+            current_text = get_char_unicode_string(current_line.pdf_character)
+            if not (
+                self._has_toc_dot_leader(previous_text)
+                and self._has_toc_dot_leader(current_text)
+            ):
+                continue
+
+            self._move_trailing_labeled_toc_prefix_to_current(
+                previous,
+                previous_line,
+                previous_text,
+                current,
+                current_line,
+                current_text,
+            )
 
     def repair_toc_unicode_fragments(self, paragraphs: list[PdfParagraph]):
         previous_clean_number: str | None = None
@@ -1574,7 +1624,8 @@ class ParagraphFinder:
             return False
 
         match = re.match(
-            r"(?P<fragment>\d+)\s+(?P<next>\d+(?:\.\d+)+\s+)",
+            rf"(?P<fragment>\d+)\s+"
+            rf"(?P<next>{self._toc_entry_prefix_pattern()})",
             current_text,
         )
         if not match:
@@ -1621,6 +1672,65 @@ class ParagraphFinder:
             return False
 
         if not re.match(r"(?:\.\d+)+\s+|\d+(?:\.\d+)*\s+", current_text):
+            return False
+
+        prefix_start_offset = match.start("prefix")
+        previous_keep_end_offset = prefix_start_offset
+        while (
+            previous_keep_end_offset > 0
+            and previous_text[previous_keep_end_offset - 1].isspace()
+        ):
+            previous_keep_end_offset -= 1
+
+        move_start = self._char_index_at_text_offset(
+            previous_line.pdf_character,
+            prefix_start_offset,
+        )
+        previous_keep_end = self._char_index_at_text_offset(
+            previous_line.pdf_character,
+            previous_keep_end_offset,
+        )
+        if move_start >= len(previous_line.pdf_character):
+            return False
+
+        moved_chars = previous_line.pdf_character[move_start:]
+        previous_line.pdf_character = self._trim_dummy_space_chars(
+            previous_line.pdf_character[:previous_keep_end],
+        )
+        current_line.pdf_character = self._trim_dummy_space_chars(
+            moved_chars + current_line.pdf_character,
+        )
+        if not previous_line.pdf_character or not current_line.pdf_character:
+            return False
+
+        self.update_line_data(previous_line)
+        self.update_line_data(current_line)
+        self.update_paragraph_data(previous, update_unicode=True)
+        self.update_paragraph_data(current, update_unicode=True)
+        return True
+
+    def _move_trailing_labeled_toc_prefix_to_current(
+        self,
+        previous: PdfParagraph,
+        previous_line: PdfLine,
+        previous_text: str,
+        current: PdfParagraph,
+        current_line: PdfLine,
+        current_text: str,
+    ) -> bool:
+        match = re.search(
+            r"(?P<body>.*?(?:\d+-\d+|-?\d+))\s+"
+            r"(?P<prefix>[A-Z][A-Za-z]{0,8})$",
+            previous_text,
+        )
+        if not match:
+            return False
+
+        if not re.match(r"[a-z][A-Za-z]*\s+\d+(?:[-.]\d+)*\.?\s+", current_text):
+            return False
+
+        combined = match.group("prefix") + current_text
+        if not re.match(self._toc_entry_prefix_pattern(), combined):
             return False
 
         prefix_start_offset = match.start("prefix")
