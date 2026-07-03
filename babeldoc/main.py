@@ -343,6 +343,16 @@ def create_parser():
         help="Skip translation step. (default: False)",
     )
     translation_group.add_argument(
+        "--skip-table-text-translate",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip translating table text layouts: table_cell, table_text, "
+            "wired_table_cell, wireless_table_cell, table_cell_hybrid. "
+            "(default: False)"
+        ),
+    )
+    translation_group.add_argument(
         "--skip-form-render",
         action="store_true",
         default=False,
@@ -720,6 +730,7 @@ async def main():
             enable_graphic_element_process=not args.disable_graphic_element_process,
             merge_alternating_line_numbers=args.merge_alternating_line_numbers,
             skip_translation=args.skip_translation,
+            skip_table_text_translate=args.skip_table_text_translate,
             skip_form_render=args.skip_form_render,
             skip_curve_render=args.skip_curve_render,
             only_parse_generate_pdf=args.only_parse_generate_pdf,

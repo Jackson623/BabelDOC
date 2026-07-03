@@ -85,6 +85,7 @@ uv run babeldoc `
 | `--disable-graphic-element-process` | 禁用图形元素处理 | 不处理图形元素。 | `False` |
 | `--no-merge-alternating-line-numbers` | 禁用交替行号合并 | 禁用默认开启的交替行号布局合并后处理。 | 默认启用合并 |
 | `--skip-translation` | 跳过翻译 | 跳过翻译步骤。 | `False` |
+| `--skip-table-text-translate` | 跳过表格文本翻译 | 跳过 `table_cell`、`table_text`、`wired_table_cell`、`wireless_table_cell`、`table_cell_hybrid` 这些表格文本布局。 | `False` |
 | `--skip-form-render` | 跳过表单渲染 | 输出时不渲染 PDF 表单。 | `False` |
 | `--skip-curve-render` | 跳过曲线渲染 | 输出时不渲染 PDF 曲线元素。 | `False` |
 | `--only-parse-generate-pdf` | 仅解析并生成 PDF | 只解析 PDF 并重新生成，不做版面分析、段落查找、样式处理和翻译。 | `False` |

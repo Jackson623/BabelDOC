@@ -37,6 +37,10 @@ def is_cid_paragraph(paragraph: il_version_1.PdfParagraph):
 
 
 NUMERIC_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
+TOC_DOT_LEADER_PATTERN = re.compile(r"(?:\.\s*){10,}")
+TOC_BROKEN_LEADER_PATTERN = re.compile(
+    r"^\s*\.?\d+(?:\.\d+)*\s+.+\.\s*\d+\s*-\s*\d*\s*$",
+)
 
 
 def is_pure_numeric_paragraph(paragraph) -> bool:
@@ -50,6 +54,17 @@ def is_pure_numeric_paragraph(paragraph) -> bool:
         return False
 
     return bool(NUMERIC_PATTERN.match(text))
+
+
+def is_toc_entry_paragraph(paragraph) -> bool:
+    if not paragraph or not getattr(paragraph, "unicode", None):
+        return False
+
+    text = re.sub(r"\s+", " ", paragraph.unicode).strip()
+    return bool(
+        TOC_DOT_LEADER_PATTERN.search(text)
+        or TOC_BROKEN_LEADER_PATTERN.match(text)
+    )
 
 
 def is_placeholder_only_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:

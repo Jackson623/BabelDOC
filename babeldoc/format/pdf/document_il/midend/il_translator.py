@@ -23,6 +23,7 @@ from babeldoc.format.pdf.document_il import PdfSameStyleCharacters
 from babeldoc.format.pdf.document_il import PdfSameStyleUnicodeCharacters
 from babeldoc.format.pdf.document_il import PdfStyle
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
+from babeldoc.format.pdf.document_il.utils.layout_helper import TABLE_TEXT_LAYOUT_LABELS
 from babeldoc.format.pdf.document_il.utils.layout_helper import get_char_unicode_string
 from babeldoc.format.pdf.document_il.utils.layout_helper import get_paragraph_unicode
 from babeldoc.format.pdf.document_il.utils.layout_helper import is_same_style
@@ -37,6 +38,9 @@ from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
 )
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_pure_numeric_paragraph,
+)
+from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
+    is_toc_entry_paragraph,
 )
 from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
 from babeldoc.format.pdf.translation_config import TitleContextSnapshot
@@ -449,7 +453,16 @@ class ILTranslator:
         tracker: PageTranslateTracker = None,
     ):
         self.translation_config.raise_if_cancelled()
+        self.normalize_toc_paragraphs(page.pdf_paragraph)
         for paragraph in page.pdf_paragraph:
+            if (
+                self.translation_config.skip_table_text_translate
+                and paragraph.layout_label in TABLE_TEXT_LAYOUT_LABELS
+            ):
+                if pbar:
+                    pbar.advance(1)
+                continue
+
             page_font_map = {}
             for font in page.pdf_font:
                 page_font_map[font.font_id] = font
@@ -493,10 +506,21 @@ class ILTranslator:
             # Original placeholder-like tokens extracted from the source text.
             # Key: exact matched token string; Value: occurrence count.
             self.original_placeholder_tokens: dict[str, int] = {}
+            self.toc_prefix: str | None = None
+            self.toc_suffix: str | None = None
 
         def set_original_placeholder_tokens(self, tokens: dict[str, int] | None):
             """Attach original placeholder-like tokens from source text."""
             self.original_placeholder_tokens = tokens or {}
+
+        def set_toc_parts(self, prefix: str, suffix: str):
+            self.toc_prefix = prefix
+            self.toc_suffix = suffix
+
+        def apply_toc_parts(self, translated_title: str) -> str:
+            if self.toc_prefix is None or self.toc_suffix is None:
+                return translated_title
+            return f"{self.toc_prefix}{translated_title.strip()}{self.toc_suffix}"
 
         def get_placeholders_hint(self) -> dict[str, str] | None:
             hint = {}
@@ -604,6 +628,14 @@ class ILTranslator:
 
         if paragraph.unicode:
             scan_placeholder_tokens(paragraph.unicode, original_placeholder_tokens)
+
+        toc_translate_input = self.get_toc_translate_input(paragraph)
+        if toc_translate_input:
+            toc_translate_input.set_original_placeholder_tokens(
+                original_placeholder_tokens,
+            )
+            return toc_translate_input
+
         if len(paragraph.pdf_paragraph_composition) == 1:
             # 如果整个段落只有一个组成部分，那么直接返回，不需要套占位符等
             composition = paragraph.pdf_paragraph_composition[0]
@@ -732,6 +764,230 @@ class ILTranslator:
         translate_input = self.TranslateInput(text, placeholders, paragraph.pdf_style)
         translate_input.set_original_placeholder_tokens(original_placeholder_tokens)
         return translate_input
+
+    def get_toc_translate_input(self, paragraph: PdfParagraph):
+        if not is_toc_entry_paragraph(paragraph):
+            return None
+
+        text = re.sub(r"\s+", " ", paragraph.unicode or "").strip()
+        text = re.sub(r"(?P<chapter>\d+)-\s+(?P<page>\d+)", r"\g<chapter>-\g<page>", text)
+        match = re.match(
+            r"^(?P<number>\.?\d+(?:\.\d+)*)\s+"
+            r"(?P<title>.*?)"
+            r"(?P<leader>(?:\.\s*)+)\s*"
+            r"(?P<page>\d+\s*-\s*\d*|\d+)"
+            r"(?:\s+.*)?$",
+            text,
+        )
+        if not match:
+            return None
+
+        title = match.group("title").strip()
+        if not title:
+            return None
+
+        prefix = f"{match.group('number')} "
+        dot_count = match.group("leader").count(".")
+        leader = "." * max(24, min(dot_count, 120))
+        page = re.sub(r"\s+", "", match.group("page"))
+        suffix = f" {leader} {page}"
+        translate_input = self.TranslateInput(title, [], paragraph.pdf_style)
+        translate_input.set_toc_parts(prefix, suffix)
+        return translate_input
+
+    def normalize_toc_paragraphs(self, paragraphs: list[PdfParagraph]):
+        index = 0
+        previous_number: str | None = None
+        previous_page: tuple[int, int] | None = None
+
+        while index < len(paragraphs):
+            paragraph = paragraphs[index]
+            text = re.sub(r"\s+", " ", paragraph.unicode or "").strip()
+            text = re.sub(
+                r"(?P<chapter>\d+)-\s+(?P<page>\d+)",
+                r"\g<chapter>-\g<page>",
+                text,
+            )
+            paragraph.unicode = text
+
+            if self._merge_toc_page_tail(paragraphs, index):
+                continue
+
+            if self._merge_split_toc_title(paragraphs, index, previous_number):
+                continue
+
+            if not is_toc_entry_paragraph(paragraph):
+                index += 1
+                continue
+
+            match = re.match(r"(?P<number>\.?\d+(?:\.\d+)*)\s+", text)
+            if not match:
+                index += 1
+                continue
+
+            raw_number = match.group("number")
+            fixed_number = self._fix_toc_number(raw_number, previous_number)
+            if fixed_number != raw_number:
+                paragraph.unicode = fixed_number + text[match.end("number") :]
+                text = paragraph.unicode.strip()
+
+            trailing = re.search(
+                r"(?P<body>.*?\d+-\d+)\s+(?P<prefix>\d+(?:\.\d*)?)$",
+                text,
+            )
+            if trailing:
+                paragraph.unicode = trailing.group("body")
+                text = paragraph.unicode.strip()
+
+            previous_page = self._repair_toc_page_by_sequence(
+                paragraph,
+                previous_page,
+            )
+
+            clean_match = re.match(r"(?P<number>\d+(?:\.\d+)*)\s+", text)
+            if clean_match:
+                previous_number = clean_match.group("number")
+            index += 1
+
+    def _merge_toc_page_tail(
+        self,
+        paragraphs: list[PdfParagraph],
+        index: int,
+    ) -> bool:
+        if index + 1 >= len(paragraphs):
+            return False
+
+        current = paragraphs[index]
+        next_paragraph = paragraphs[index + 1]
+        current_text = re.sub(r"\s+", " ", current.unicode or "").strip()
+        next_text = re.sub(r"\s+", " ", next_paragraph.unicode or "").strip()
+        if not re.fullmatch(r"\d+", next_text):
+            return False
+        if not re.match(r"\.?\d+(?:\.\d+)*\s+", current_text):
+            return False
+        if not re.search(r"\.\s*\d+-$", current_text):
+            return False
+
+        current.unicode = f"{current_text}{next_text}"
+        current.pdf_paragraph_composition.extend(
+            next_paragraph.pdf_paragraph_composition
+        )
+        if current.box and next_paragraph.box:
+            current.box = il_version_1.Box(
+                x=min(current.box.x, next_paragraph.box.x),
+                y=min(current.box.y, next_paragraph.box.y),
+                x2=max(current.box.x2, next_paragraph.box.x2),
+                y2=max(current.box.y2, next_paragraph.box.y2),
+            )
+        del paragraphs[index + 1]
+        return True
+
+    @staticmethod
+    def _repair_toc_page_by_sequence(
+        paragraph: PdfParagraph,
+        previous_page: tuple[int, int] | None,
+    ) -> tuple[int, int] | None:
+        text = re.sub(r"\s+", " ", paragraph.unicode or "").strip()
+        match = re.search(r"(?P<prefix>.*?)(?P<chapter>\d+)-(?P<page>\d+)$", text)
+        if not match:
+            return previous_page
+
+        chapter = int(match.group("chapter"))
+        page = int(match.group("page"))
+        if previous_page is None or previous_page[0] != chapter:
+            return (chapter, page)
+
+        previous_page_number = previous_page[1]
+        if page >= previous_page_number:
+            return (chapter, page)
+
+        page_fragment = str(page)
+        next_page_text = str(previous_page_number + 1)
+        if next_page_text.startswith(page_fragment):
+            fixed_page = previous_page_number + 1
+        else:
+            for candidate in range(previous_page_number, previous_page_number + 6):
+                candidate_text = str(candidate)
+                if candidate_text.endswith(page_fragment):
+                    fixed_page = candidate
+                    break
+            else:
+                return (chapter, page)
+
+        paragraph.unicode = f"{match.group('prefix')}{chapter}-{fixed_page}"
+        return (chapter, fixed_page)
+
+    def _merge_split_toc_title(
+        self,
+        paragraphs: list[PdfParagraph],
+        index: int,
+        previous_number: str | None,
+    ) -> bool:
+        if index + 1 >= len(paragraphs) or not previous_number:
+            return False
+
+        current = paragraphs[index]
+        next_paragraph = paragraphs[index + 1]
+        current_text = re.sub(r"\s+", " ", current.unicode or "").strip()
+        next_text = re.sub(r"\s+", " ", next_paragraph.unicode or "").strip()
+        if is_toc_entry_paragraph(current) or not is_toc_entry_paragraph(
+            next_paragraph
+        ):
+            return False
+        if re.match(r"\d+(?:\.\d+)*\s+", next_text):
+            return False
+
+        match = re.match(
+            r"(?P<number>\.?\d+(?:\.\d+)*)\s+(?P<head>\S+)$",
+            current_text,
+        )
+        if not match:
+            return False
+
+        fixed_number = self._fix_toc_number(match.group("number"), previous_number)
+        current.unicode = f"{fixed_number} {match.group('head')}{next_text}"
+        current.pdf_paragraph_composition.extend(
+            next_paragraph.pdf_paragraph_composition
+        )
+        if current.box and next_paragraph.box:
+            current.box = il_version_1.Box(
+                x=min(current.box.x, next_paragraph.box.x),
+                y=min(current.box.y, next_paragraph.box.y),
+                x2=max(current.box.x2, next_paragraph.box.x2),
+                y2=max(current.box.y2, next_paragraph.box.y2),
+            )
+        del paragraphs[index + 1]
+        return True
+
+    @staticmethod
+    def _fix_toc_number(raw_number: str, previous_number: str | None) -> str:
+        if not previous_number:
+            return raw_number.lstrip(".")
+
+        expected = ILTranslator._increment_toc_number(previous_number)
+        current = raw_number.lstrip(".")
+        if current == expected:
+            return current
+        if expected.endswith("." + current):
+            return expected
+        if expected.split(".")[-1].endswith(current):
+            return expected
+
+        previous_parts = previous_number.split(".")
+        current_parts = current.split(".")
+        if raw_number.startswith(".") and len(current_parts) < len(previous_parts):
+            prefix_len = len(previous_parts) - len(current_parts)
+            return ".".join(previous_parts[:prefix_len] + current_parts)
+        return current
+
+    @staticmethod
+    def _increment_toc_number(number: str) -> str:
+        parts = number.split(".")
+        try:
+            parts[-1] = str(int(parts[-1]) + 1)
+        except ValueError:
+            return number
+        return ".".join(parts)
 
     def process_formula(
         self,
@@ -1001,6 +1257,7 @@ class ILTranslator:
             if llm_translate_tracker := tracker.last_llm_translate_tracker():
                 llm_translate_tracker.set_placeholder_full_match()
             return False
+        translated_text = translate_input.apply_toc_parts(translated_text)
         paragraph.unicode = translated_text
         paragraph.pdf_paragraph_composition = self.parse_translate_output(
             translate_input,

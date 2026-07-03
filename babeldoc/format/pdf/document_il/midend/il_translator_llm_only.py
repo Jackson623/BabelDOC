@@ -22,12 +22,16 @@ from babeldoc.format.pdf.document_il.midend.il_translator import (
     ParagraphTranslateTracker,
 )
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
+from babeldoc.format.pdf.document_il.utils.layout_helper import TABLE_TEXT_LAYOUT_LABELS
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import is_cid_paragraph
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_placeholder_only_paragraph,
 )
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_pure_numeric_paragraph,
+)
+from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
+    is_toc_entry_paragraph,
 )
 from babeldoc.format.pdf.translation_config import TitleContextSnapshot
 from babeldoc.format.pdf.translation_config import TranslationConfig
@@ -295,6 +299,12 @@ class ILTranslatorLLMOnly:
         if translated_ids is not None and id(paragraph) in translated_ids:
             return False
 
+        if (
+            self.translation_config.skip_table_text_translate
+            and paragraph.layout_label in TABLE_TEXT_LAYOUT_LABELS
+        ):
+            return False
+
         # CID paragraph check
         if is_cid_paragraph(paragraph):
             return False
@@ -535,6 +545,7 @@ class ILTranslatorLLMOnly:
         translated_ids: set | None = None,
     ):
         self.translation_config.raise_if_cancelled()
+        self.il_translator.normalize_toc_paragraphs(page.pdf_paragraph)
         page_font_map = {}
         for font in page.pdf_font:
             page_font_map[font.font_id] = font
@@ -546,10 +557,39 @@ class ILTranslatorLLMOnly:
 
         paragraphs = []
 
+        def submit_batch(
+            batch_paragraphs: list[PdfParagraph],
+            token_count: int,
+        ):
+            if not batch_paragraphs:
+                return
+            self.mid += 1
+            executor.submit(
+                self.translate_paragraph,
+                BatchParagraph(batch_paragraphs, [page] * len(batch_paragraphs), tracker),
+                pbar,
+                page_font_map,
+                page_xobj_font_map,
+                self.translation_config.shared_context_cross_split_part.first_paragraph,
+                self.translation_config.shared_context_cross_split_part.recent_title_paragraph,
+                executor2,
+                priority=1048576 - token_count,
+                paragraph_token_count=token_count,
+                mp_id=self.mid,
+            )
+
         total_token_count = 0
         for paragraph in page.pdf_paragraph:
             # Check if already translated
             if id(paragraph) in translated_ids:
+                continue
+
+            if (
+                self.translation_config.skip_table_text_translate
+                and paragraph.layout_label in TABLE_TEXT_LAYOUT_LABELS
+            ):
+                if pbar:
+                    pbar.advance(1)
                 continue
 
             # Check basic validation
@@ -578,8 +618,17 @@ class ILTranslatorLLMOnly:
                     pbar.advance(1)
                 continue
 
+            paragraph_token_count = self.calc_token_count(paragraph.unicode)
+            if is_toc_entry_paragraph(paragraph):
+                submit_batch(paragraphs, total_token_count)
+                paragraphs = []
+                total_token_count = 0
+                translated_ids.add(id(paragraph))
+                submit_batch([paragraph], paragraph_token_count)
+                continue
+
             # self.translate_paragraph(paragraph, pbar,tracker.new_paragraph(), page_font_map, page_xobj_font_map)
-            total_token_count += self.calc_token_count(paragraph.unicode)
+            total_token_count += paragraph_token_count
             paragraphs.append(paragraph)
             translated_ids.add(id(paragraph))
             if paragraph.layout_label == "title":
@@ -590,38 +639,12 @@ class ILTranslatorLLMOnly:
                 )
 
             if total_token_count > 200 or len(paragraphs) > 5:
-                self.mid += 1
-                executor.submit(
-                    self.translate_paragraph,
-                    BatchParagraph(paragraphs, [page] * len(paragraphs), tracker),
-                    pbar,
-                    page_font_map,
-                    page_xobj_font_map,
-                    self.translation_config.shared_context_cross_split_part.first_paragraph,
-                    self.translation_config.shared_context_cross_split_part.recent_title_paragraph,
-                    executor2,
-                    priority=1048576 - total_token_count,
-                    paragraph_token_count=total_token_count,
-                    mp_id=self.mid,
-                )
+                submit_batch(paragraphs, total_token_count)
                 paragraphs = []
                 total_token_count = 0
 
         if paragraphs:
-            self.mid += 1
-            executor.submit(
-                self.translate_paragraph,
-                BatchParagraph(paragraphs, [page] * len(paragraphs), tracker),
-                pbar,
-                page_font_map,
-                page_xobj_font_map,
-                self.translation_config.shared_context_cross_split_part.first_paragraph,
-                self.translation_config.shared_context_cross_split_part.recent_title_paragraph,
-                executor2,
-                priority=1048576 - total_token_count,
-                paragraph_token_count=total_token_count,
-                mp_id=self.mid,
-            )
+            submit_batch(paragraphs, total_token_count)
 
     def translate_paragraph(
         self,

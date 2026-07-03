@@ -154,8 +154,9 @@ class ParagraphFinder:
         max_x = max(char.visual_bbox.box.x2 for char in chars)
         max_y = max(char.visual_bbox.box.y2 for char in chars)
         paragraph.box = Box(min_x, min_y, max_x, max_y)
-        paragraph.vertical = chars[0].vertical
-        paragraph.xobj_id = chars[0].xobj_id
+        first_real_char = next((char for char in chars if char.xobj_id is not None), chars[0])
+        paragraph.vertical = first_real_char.vertical
+        paragraph.xobj_id = first_real_char.xobj_id
 
         paragraph.first_line_indent = False
         if (
@@ -285,10 +286,18 @@ class ParagraphFinder:
 
         # 第五步：处理独立段落
         self.process_independent_paragraphs(paragraphs, median_width)
+        self.split_toc_entry_paragraphs(paragraphs)
+        self.merge_toc_page_number_fragments(paragraphs)
 
         # 新增后处理：合并带行号交替的正文段落（a 正文、b 行号、c 正文 -> 合并 a 与 c，保留 b）
         if getattr(self.translation_config, "merge_alternating_line_numbers", True):
             self.merge_alternating_line_number_paragraphs(paragraphs)
+
+        self.split_toc_entry_paragraphs(paragraphs)
+        self.merge_toc_page_number_fragments(paragraphs)
+        self.repair_toc_split_fragments(paragraphs)
+        self.split_toc_entry_paragraphs(paragraphs)
+        self.merge_toc_page_number_fragments(paragraphs)
 
         for paragraph in paragraphs:
             self.update_paragraph_data(paragraph, update_unicode=True)
@@ -300,6 +309,7 @@ class ParagraphFinder:
             page.pdf_character = []
 
         self.fix_overlapping_paragraphs(page)
+        self.repair_toc_unicode_fragments(page.pdf_paragraph)
 
         # 第六步：对每一行的字符进行排序
         # self._sort_characters_in_lines(page)
@@ -861,9 +871,8 @@ class ParagraphFinder:
                 prev_width = prev_line.box.x2 - prev_line.box.x
                 prev_text = "".join([c.char_unicode for c in prev_line.pdf_character])
 
-                # 检查是否包含连续的点（至少 20 个）
-                # 如果有至少连续 20 个点，则代表这是目录条目
-                if re.search(r"\.{20,}", prev_text):
+                # 检查是否包含目录点线（至少 20 个点，允许点之间有空格）
+                if self._has_toc_dot_leader(prev_text):
                     # 创建新的段落
                     new_paragraph = PdfParagraph(
                         box=Box(0, 0, 0, 0),  # 临时边界框
@@ -926,6 +935,475 @@ class ParagraphFinder:
                     break
                 j += 1
             i += 1
+
+    @staticmethod
+    def _has_toc_dot_leader(text: str) -> bool:
+        return re.search(r"(?:\.\s*){20,}", text) is not None
+
+    def split_toc_entry_paragraphs(self, paragraphs: list[PdfParagraph]):
+        new_paragraphs: list[PdfParagraph] = []
+        for paragraph in paragraphs:
+            split_compositions: list[PdfParagraphComposition] = []
+            changed = False
+
+            for composition in paragraph.pdf_paragraph_composition:
+                if not composition.pdf_line:
+                    split_compositions.append(composition)
+                    continue
+
+                line_groups = self._split_toc_line_chars(composition.pdf_line)
+                if len(line_groups) == 1:
+                    split_compositions.append(composition)
+                    continue
+
+                changed = True
+                for chars in line_groups:
+                    line = PdfLine(pdf_character=chars)
+                    self.update_line_data(line)
+                    split_compositions.append(PdfParagraphComposition(pdf_line=line))
+
+            if not changed:
+                new_paragraphs.append(paragraph)
+                continue
+
+            for composition in split_compositions:
+                new_paragraph = PdfParagraph(
+                    box=Box(0, 0, 0, 0),
+                    pdf_style=paragraph.pdf_style,
+                    pdf_paragraph_composition=[composition],
+                    unicode="",
+                    scale=paragraph.scale,
+                    optimal_scale=paragraph.optimal_scale,
+                    debug_id=generate_base58_id(),
+                    layout_label=paragraph.layout_label,
+                    layout_id=paragraph.layout_id,
+                    render_order=paragraph.render_order,
+                )
+                self.update_paragraph_data(new_paragraph, update_unicode=True)
+                new_paragraphs.append(new_paragraph)
+
+        paragraphs[:] = new_paragraphs
+
+    def _split_toc_line_chars(self, line: PdfLine) -> list[list[PdfCharacter]]:
+        text = get_char_unicode_string(line.pdf_character)
+        if not self._has_toc_dot_leader(text):
+            return [line.pdf_character]
+
+        split_offsets = [
+            match.start("next")
+            for match in re.finditer(
+                r"(?<![-\d])(?P<page>\d+-\d+|\d+)\s+(?P<next>\d+(?:\.\d+)+\s+)",
+                text,
+            )
+        ]
+        if not split_offsets:
+            return [line.pdf_character]
+
+        split_char_indexes: list[int] = []
+        offset_index = 0
+        text_offset = 0
+        for char_index, char in enumerate(line.pdf_character):
+            char_text = char.char_unicode or ""
+            next_offset = text_offset + len(char_text)
+            while (
+                offset_index < len(split_offsets)
+                and split_offsets[offset_index] < next_offset
+            ):
+                split_char_indexes.append(char_index)
+                offset_index += 1
+            text_offset = next_offset
+
+        groups: list[list[PdfCharacter]] = []
+        start = 0
+        for split_index in split_char_indexes:
+            if split_index <= start:
+                continue
+            groups.append(line.pdf_character[start:split_index])
+            start = split_index
+        if start < len(line.pdf_character):
+            groups.append(line.pdf_character[start:])
+
+        trimmed_groups = [self._trim_dummy_space_chars(group) for group in groups]
+        return [group for group in trimmed_groups if group]
+
+    def merge_toc_page_number_fragments(self, paragraphs: list[PdfParagraph]):
+        for index in range(1, len(paragraphs)):
+            previous = paragraphs[index - 1]
+            current = paragraphs[index]
+            previous_line = self._get_only_line(previous)
+            current_line = self._get_only_line(current)
+            if not previous_line or not current_line:
+                continue
+
+            previous_text = get_char_unicode_string(previous_line.pdf_character)
+            current_text = get_char_unicode_string(current_line.pdf_character)
+            if not (
+                self._has_toc_dot_leader(previous_text)
+                and self._has_toc_dot_leader(current_text)
+            ):
+                continue
+
+            match = re.match(
+                r"(?:\.\s*)?(?P<fragment>\d+-\d+|-?\d+)\s+(?P<next>\d+(?:\.\d+)+\s+)",
+                current_text,
+            )
+            if not match:
+                continue
+
+            move_end = self._char_index_at_text_offset(
+                current_line.pdf_character,
+                match.end("fragment"),
+            )
+            keep_start = self._char_index_at_text_offset(
+                current_line.pdf_character,
+                match.start("next"),
+            )
+            if move_end <= 0 or keep_start <= move_end:
+                continue
+
+            previous_line.pdf_character.extend(current_line.pdf_character[:move_end])
+            current_line.pdf_character = self._trim_dummy_space_chars(
+                current_line.pdf_character[keep_start:],
+            )
+            if not current_line.pdf_character:
+                continue
+
+            self.update_line_data(previous_line)
+            self.update_line_data(current_line)
+            self.update_paragraph_data(previous, update_unicode=True)
+            self.update_paragraph_data(current, update_unicode=True)
+
+    def repair_toc_split_fragments(self, paragraphs: list[PdfParagraph]):
+        changed = True
+        while changed:
+            changed = False
+            for index in range(1, len(paragraphs)):
+                previous = paragraphs[index - 1]
+                current = paragraphs[index]
+                previous_line = self._get_only_line(previous)
+                current_line = self._get_only_line(current)
+                if not previous_line or not current_line:
+                    continue
+
+                previous_text = get_char_unicode_string(previous_line.pdf_character)
+                current_text = get_char_unicode_string(current_line.pdf_character)
+                if not (
+                    self._has_toc_dot_leader(previous_text)
+                    and self._has_toc_dot_leader(current_text)
+                ):
+                    continue
+
+                if self._move_leading_page_tail_to_previous(
+                    previous,
+                    previous_line,
+                    previous_text,
+                    current,
+                    current_line,
+                    current_text,
+                ):
+                    changed = True
+                    continue
+
+                if self._move_trailing_section_prefix_to_current(
+                    previous,
+                    previous_line,
+                    previous_text,
+                    current,
+                    current_line,
+                    current_text,
+                ):
+                    changed = True
+
+    def merge_isolated_toc_page_tails(self, paragraphs: list[PdfParagraph]):
+        index = 1
+        while index < len(paragraphs):
+            previous = paragraphs[index - 1]
+            current = paragraphs[index]
+            next_paragraph = (
+                paragraphs[index + 1] if index + 1 < len(paragraphs) else None
+            )
+            previous_line = self._get_only_line(previous)
+            current_line = self._get_only_line(current)
+            next_line = self._get_only_line(next_paragraph) if next_paragraph else None
+            if not previous_line or not current_line:
+                index += 1
+                continue
+
+            previous_text = get_char_unicode_string(previous_line.pdf_character)
+            current_text = get_char_unicode_string(current_line.pdf_character).strip()
+            next_text = (
+                get_char_unicode_string(next_line.pdf_character) if next_line else ""
+            )
+            if not (
+                self._has_toc_dot_leader(previous_text)
+                and re.search(r"\d+-$", previous_text)
+                and re.fullmatch(r"\d+", current_text)
+                and (not next_text or self._has_toc_dot_leader(next_text))
+            ):
+                index += 1
+                continue
+
+            previous_line.pdf_character.extend(current_line.pdf_character)
+            self.update_line_data(previous_line)
+            self.update_paragraph_data(previous, update_unicode=True)
+            del paragraphs[index]
+
+    def repair_toc_unicode_fragments(self, paragraphs: list[PdfParagraph]):
+        previous_clean_number: str | None = None
+        previous_trailing_prefix: str | None = None
+
+        for paragraph in paragraphs:
+            text = (paragraph.unicode or "").strip()
+            if not self._has_toc_dot_leader(text):
+                previous_trailing_prefix = None
+                continue
+
+            raw_number_match = re.match(
+                r"(?P<number>\.?\d+(?:\.\d+)*)\s+",
+                text,
+            )
+            if not raw_number_match:
+                previous_trailing_prefix = None
+                continue
+
+            raw_number = raw_number_match.group("number")
+            fixed_number = raw_number
+            if previous_trailing_prefix:
+                fixed_number = self._combine_toc_number_fragments(
+                    previous_trailing_prefix,
+                    raw_number,
+                    previous_clean_number,
+                )
+            elif raw_number.startswith(".") and previous_clean_number:
+                fixed_number = self._complete_toc_number_from_previous(
+                    previous_clean_number,
+                    raw_number,
+                )
+
+            if fixed_number != raw_number:
+                paragraph.unicode = fixed_number + text[raw_number_match.end("number") :]
+                text = paragraph.unicode.strip()
+
+            sequence_number = self._repair_toc_number_by_sequence(
+                fixed_number,
+                previous_clean_number,
+            )
+            if sequence_number and sequence_number != fixed_number:
+                number_match = re.match(
+                    r"(?P<number>\.?\d+(?:\.\d+)*)\s+",
+                    text,
+                )
+                if number_match:
+                    paragraph.unicode = (
+                        sequence_number + text[number_match.end("number") :]
+                    )
+                    text = paragraph.unicode.strip()
+                    fixed_number = sequence_number
+
+            trailing_prefix_match = re.search(
+                r"(?P<body>.*?\d+-\d+)\s+(?P<prefix>\d+(?:\.\d*)?)$",
+                text,
+            )
+            if trailing_prefix_match:
+                paragraph.unicode = trailing_prefix_match.group("body")
+                previous_trailing_prefix = trailing_prefix_match.group("prefix")
+                text = paragraph.unicode.strip()
+            else:
+                previous_trailing_prefix = None
+
+            clean_number_match = re.match(r"(?P<number>\d+(?:\.\d+)*)\s+", text)
+            if clean_number_match:
+                previous_clean_number = clean_number_match.group("number")
+
+    @staticmethod
+    def _combine_toc_number_fragments(
+        prefix: str,
+        raw_number: str,
+        previous_number: str | None,
+    ) -> str:
+        candidates: list[str] = []
+        if raw_number.startswith(".") or prefix.endswith("."):
+            candidates.append(prefix + raw_number)
+        else:
+            candidates.append(prefix + "." + raw_number)
+            candidates.append(prefix + raw_number)
+
+        if previous_number:
+            expected = ParagraphFinder._increment_toc_number(previous_number)
+            for candidate in candidates:
+                if candidate == expected:
+                    return candidate
+
+        return candidates[0]
+
+    @staticmethod
+    def _complete_toc_number_from_previous(
+        previous_number: str,
+        raw_number: str,
+    ) -> str:
+        fragment_parts = raw_number.lstrip(".").split(".")
+        previous_parts = previous_number.split(".")
+        prefix_len = max(0, len(previous_parts) - len(fragment_parts))
+        return ".".join(previous_parts[:prefix_len] + fragment_parts)
+
+    @staticmethod
+    def _increment_toc_number(number: str) -> str:
+        parts = number.split(".")
+        try:
+            parts[-1] = str(int(parts[-1]) + 1)
+        except ValueError:
+            return number
+        return ".".join(parts)
+
+    @staticmethod
+    def _repair_toc_number_by_sequence(
+        current_number: str,
+        previous_number: str | None,
+    ) -> str | None:
+        if not previous_number or not current_number:
+            return None
+
+        expected = ParagraphFinder._increment_toc_number(previous_number)
+        current = current_number.lstrip(".")
+        if current == expected:
+            return None
+        if expected.endswith("." + current):
+            return expected
+        if expected.split(".")[-1].endswith(current):
+            return expected
+        return None
+
+    def _move_leading_page_tail_to_previous(
+        self,
+        previous: PdfParagraph,
+        previous_line: PdfLine,
+        previous_text: str,
+        current: PdfParagraph,
+        current_line: PdfLine,
+        current_text: str,
+    ) -> bool:
+        if not re.search(r"\d+-$", previous_text):
+            return False
+
+        match = re.match(
+            r"(?P<fragment>\d+)\s+(?P<next>\d+(?:\.\d+)+\s+)",
+            current_text,
+        )
+        if not match:
+            return False
+
+        move_end = self._char_index_at_text_offset(
+            current_line.pdf_character,
+            match.end("fragment"),
+        )
+        keep_start = self._char_index_at_text_offset(
+            current_line.pdf_character,
+            match.start("next"),
+        )
+        if move_end <= 0 or keep_start <= move_end:
+            return False
+
+        previous_line.pdf_character.extend(current_line.pdf_character[:move_end])
+        current_line.pdf_character = self._trim_dummy_space_chars(
+            current_line.pdf_character[keep_start:],
+        )
+        if not current_line.pdf_character:
+            return False
+
+        self.update_line_data(previous_line)
+        self.update_line_data(current_line)
+        self.update_paragraph_data(previous, update_unicode=True)
+        self.update_paragraph_data(current, update_unicode=True)
+        return True
+
+    def _move_trailing_section_prefix_to_current(
+        self,
+        previous: PdfParagraph,
+        previous_line: PdfLine,
+        previous_text: str,
+        current: PdfParagraph,
+        current_line: PdfLine,
+        current_text: str,
+    ) -> bool:
+        match = re.search(
+            r"(?P<page>\d+-\d+)\s+(?P<prefix>\d+(?:\.\d*)?)$",
+            previous_text,
+        )
+        if not match:
+            return False
+
+        if not re.match(r"(?:\.\d+)+\s+|\d+(?:\.\d+)*\s+", current_text):
+            return False
+
+        prefix_start_offset = match.start("prefix")
+        previous_keep_end_offset = prefix_start_offset
+        while (
+            previous_keep_end_offset > 0
+            and previous_text[previous_keep_end_offset - 1].isspace()
+        ):
+            previous_keep_end_offset -= 1
+
+        move_start = self._char_index_at_text_offset(
+            previous_line.pdf_character,
+            prefix_start_offset,
+        )
+        previous_keep_end = self._char_index_at_text_offset(
+            previous_line.pdf_character,
+            previous_keep_end_offset,
+        )
+        if move_start >= len(previous_line.pdf_character):
+            return False
+
+        moved_chars = previous_line.pdf_character[move_start:]
+        previous_line.pdf_character = self._trim_dummy_space_chars(
+            previous_line.pdf_character[:previous_keep_end],
+        )
+        current_line.pdf_character = self._trim_dummy_space_chars(
+            moved_chars + current_line.pdf_character,
+        )
+        if not previous_line.pdf_character or not current_line.pdf_character:
+            return False
+
+        self.update_line_data(previous_line)
+        self.update_line_data(current_line)
+        self.update_paragraph_data(previous, update_unicode=True)
+        self.update_paragraph_data(current, update_unicode=True)
+        return True
+
+    @staticmethod
+    def _get_only_line(paragraph: PdfParagraph) -> PdfLine | None:
+        if len(paragraph.pdf_paragraph_composition) != 1:
+            return None
+        return paragraph.pdf_paragraph_composition[0].pdf_line
+
+    @staticmethod
+    def _char_index_at_text_offset(chars: list[PdfCharacter], offset: int) -> int:
+        if offset <= 0:
+            return 0
+        text_offset = 0
+        for char_index, char in enumerate(chars):
+            text_offset += len(char.char_unicode or "")
+            if text_offset >= offset:
+                return char_index + 1
+        return len(chars)
+
+    @staticmethod
+    def _trim_dummy_space_chars(chars: list[PdfCharacter]) -> list[PdfCharacter]:
+        start = 0
+        end = len(chars)
+        while (
+            start < end
+            and chars[start].xobj_id is None
+            and (chars[start].char_unicode or "").isspace()
+        ):
+            start += 1
+        while (
+            end > start
+            and chars[end - 1].xobj_id is None
+            and (chars[end - 1].char_unicode or "").isspace()
+        ):
+            end -= 1
+        return chars[start:end]
 
     @staticmethod
     def is_bbox_contain_in_vertical(bbox1: Box, bbox2: Box) -> bool:

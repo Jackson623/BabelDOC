@@ -217,6 +217,7 @@ class TranslationConfig:
         metadata_extra_data: str | None = None,
         term_pool_max_workers: int | None = None,
         disable_same_text_fallback: bool = False,
+        skip_table_text_translate: bool = False,
     ):
         self.translator = translator
         self.term_extraction_translator = term_extraction_translator or translator
@@ -335,6 +336,7 @@ class TranslationConfig:
         self.auto_extract_glossary = auto_extract_glossary
         self.auto_enable_ocr_workaround = auto_enable_ocr_workaround
         self.skip_translation = skip_translation
+        self.skip_table_text_translate = skip_table_text_translate
         self.only_parse_generate_pdf = only_parse_generate_pdf
 
         if self.skip_translation or self.only_parse_generate_pdf:

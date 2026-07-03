@@ -15,6 +15,17 @@ from babeldoc.format.pdf.document_il.il_version_1 import PdfParagraph
 from babeldoc.format.pdf.document_il.il_version_1 import PdfParagraphComposition
 
 logger = logging.getLogger(__name__)
+
+TABLE_TEXT_LAYOUT_LABELS = frozenset(
+    {
+        "table_cell",
+        "table_text",
+        "wired_table_cell",
+        "wireless_table_cell",
+        "table_cell_hybrid",
+    },
+)
+
 # HEIGHT_NOT_USFUL_CHAR_IN_CHAR = (
 #     "∑︁",
 #     # 暂时假设 cid:17 和 cid 16 是特殊情况
