@@ -13,6 +13,7 @@ from babeldoc.format.pdf.document_il import PdfLine
 from babeldoc.format.pdf.document_il import PdfParagraph
 from babeldoc.format.pdf.document_il import PdfParagraphComposition
 from babeldoc.format.pdf.document_il import PdfRectangle
+from babeldoc.format.pdf.document_il import VisualBbox
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.document_il.utils.formular_helper import (
     collect_page_formula_font_ids,
@@ -286,6 +287,9 @@ class ParagraphFinder:
 
         # 第五步：处理独立段落
         self.process_independent_paragraphs(paragraphs, median_width)
+        self.merge_inline_text_fragments(paragraphs)
+        self.merge_instruction_list_continuations(paragraphs)
+        self.split_instruction_list_paragraphs(paragraphs)
         self.split_toc_entry_paragraphs(paragraphs)
         self.merge_toc_page_number_fragments(paragraphs)
 
@@ -296,6 +300,9 @@ class ParagraphFinder:
         self.split_toc_entry_paragraphs(paragraphs)
         self.merge_toc_page_number_fragments(paragraphs)
         self.repair_toc_split_fragments(paragraphs)
+        self.merge_inline_text_fragments(paragraphs)
+        self.merge_instruction_list_continuations(paragraphs)
+        self.split_instruction_list_paragraphs(paragraphs)
         self.split_toc_entry_paragraphs(paragraphs)
         self.merge_toc_page_number_fragments(paragraphs)
 
@@ -937,6 +944,287 @@ class ParagraphFinder:
             i += 1
 
     @staticmethod
+    def _get_line_text(line: PdfLine) -> str:
+        return get_char_unicode_string(line.pdf_character)
+
+    @staticmethod
+    def _is_instruction_list_label(text: str) -> bool:
+        return (
+            re.match(
+                r"^[A-Z][A-Z0-9]*(?:/[A-Z][A-Z0-9]*)*\s+\S",
+                text.strip(),
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _line_y_overlap_ratio(a: PdfLine, b: PdfLine) -> float:
+        if not a.box or not b.box:
+            return 0.0
+        overlap = min(a.box.y2, b.box.y2) - max(a.box.y, b.box.y)
+        if overlap <= 0:
+            return 0.0
+        min_height = min(a.box.y2 - a.box.y, b.box.y2 - b.box.y)
+        if min_height <= 0:
+            return 0.0
+        return overlap / min_height
+
+    def _append_line_chars(self, target: PdfLine, source: PdfLine):
+        space_char = self._make_inline_space_char(target, source)
+        if space_char:
+            target.pdf_character.append(space_char)
+        target.pdf_character.extend(source.pdf_character)
+        target.pdf_character.sort(key=lambda c: c.visual_bbox.box.x)
+        self.update_line_data(target)
+
+    @staticmethod
+    def _make_inline_space_char(
+        target: PdfLine,
+        source: PdfLine,
+    ) -> PdfCharacter | None:
+        if not target.pdf_character or not source.pdf_character:
+            return None
+
+        target_text = get_char_unicode_string(target.pdf_character).rstrip()
+        source_text = get_char_unicode_string(source.pdf_character).lstrip()
+        if not target_text or not source_text:
+            return None
+        if not source_text[0].isalnum():
+            return None
+
+        last_char = max(target.pdf_character, key=lambda c: c.visual_bbox.box.x2)
+        first_char = min(source.pdf_character, key=lambda c: c.visual_bbox.box.x)
+        gap = first_char.visual_bbox.box.x - last_char.visual_bbox.box.x2
+        if gap <= 0:
+            return None
+        should_insert = target_text[-1] in ",;:" or gap > 2
+        if not should_insert:
+            return None
+
+        width = min(gap, max(gap * 0.8, 1))
+        box = Box(
+            x=last_char.visual_bbox.box.x2,
+            y=first_char.visual_bbox.box.y,
+            x2=last_char.visual_bbox.box.x2 + width,
+            y2=first_char.visual_bbox.box.y2,
+        )
+        return PdfCharacter(
+            pdf_style=first_char.pdf_style,
+            box=box,
+            char_unicode=" ",
+            scale=first_char.scale,
+            advance=box.x2 - box.x,
+            visual_bbox=VisualBbox(box=box),
+        )
+
+    def merge_inline_text_fragments(self, paragraphs: list[PdfParagraph]):
+        """Join same-baseline text fragments split by overlapping layout boxes."""
+        index = 1
+        while index < len(paragraphs):
+            previous = paragraphs[index - 1]
+            current = paragraphs[index]
+            previous_line = self._get_last_line(previous)
+            current_line = self._get_first_line(current)
+            if not previous_line or not current_line:
+                index += 1
+                continue
+
+            if not self._can_merge_inline_fragment(
+                previous,
+                previous_line,
+                current,
+                current_line,
+            ):
+                index += 1
+                continue
+
+            self._append_line_chars(previous_line, current_line)
+            current.pdf_paragraph_composition.pop(0)
+            if current.pdf_paragraph_composition:
+                self.update_paragraph_data(previous, update_unicode=True)
+                self.update_paragraph_data(current, update_unicode=True)
+                index += 1
+            else:
+                del paragraphs[index]
+                self.update_paragraph_data(previous, update_unicode=True)
+
+    def _can_merge_inline_fragment(
+        self,
+        previous: PdfParagraph,
+        previous_line: PdfLine,
+        current: PdfParagraph,
+        current_line: PdfLine,
+    ) -> bool:
+        if previous.xobj_id != current.xobj_id:
+            return False
+        text_labels = ("plain text", "text", "paragraph", "content")
+        if previous.layout_label not in text_labels:
+            return False
+        if current.layout_label != previous.layout_label and (
+            current.layout_label != "fallback_line"
+        ):
+            return False
+        if not previous_line.box or not current_line.box:
+            return False
+        if self._line_y_overlap_ratio(previous_line, current_line) < 0.45:
+            return False
+        gap = current_line.box.x - previous_line.box.x2
+        if gap < -1 or gap > 12:
+            return False
+
+        current_text = self._get_line_text(current_line).strip()
+        previous_text = self._get_line_text(previous_line).rstrip()
+        if not current_text or self._is_instruction_list_label(current_text):
+            return False
+        if previous_text.endswith((".", ":", ";")) and current_text[0].isalnum():
+            return False
+        return True
+
+    def merge_instruction_list_continuations(self, paragraphs: list[PdfParagraph]):
+        index = 1
+        while index < len(paragraphs):
+            previous = paragraphs[index - 1]
+            current = paragraphs[index]
+            previous_line = self._get_last_line(previous)
+            current_line = self._get_first_line(current)
+            first_previous_line = self._get_first_line(previous)
+            if not previous_line or not current_line or not first_previous_line:
+                index += 1
+                continue
+            if not self._is_instruction_list_label(self._get_line_text(first_previous_line)):
+                index += 1
+                continue
+            if self._is_instruction_list_label(self._get_line_text(current_line)):
+                index += 1
+                continue
+            if previous.xobj_id != current.xobj_id:
+                index += 1
+                continue
+            if not previous_line.box or not current_line.box:
+                index += 1
+                continue
+            line_height = max(previous_line.box.y2 - previous_line.box.y, 1)
+            vertical_gap = previous_line.box.y - current_line.box.y2
+            description_x = self._instruction_description_x(first_previous_line)
+            if (
+                -1 <= vertical_gap <= line_height * 1.2
+                and description_x is not None
+                and abs(current_line.box.x - description_x) <= 8
+            ):
+                previous.pdf_paragraph_composition.extend(
+                    current.pdf_paragraph_composition
+                )
+                self.update_paragraph_data(previous, update_unicode=True)
+                del paragraphs[index]
+                continue
+            index += 1
+
+    @staticmethod
+    def _instruction_description_x(line: PdfLine) -> float | None:
+        chars = line.pdf_character
+        seen_non_space = False
+        for index, char in enumerate(chars):
+            text = char.char_unicode or ""
+            if text.isspace() and seen_non_space:
+                for next_char in chars[index + 1 :]:
+                    if not (next_char.char_unicode or "").isspace():
+                        return next_char.visual_bbox.box.x
+                return None
+            if not text.isspace():
+                seen_non_space = True
+        return None
+
+    def split_instruction_list_paragraphs(self, paragraphs: list[PdfParagraph]):
+        new_paragraphs: list[PdfParagraph] = []
+        for paragraph in paragraphs:
+            lines = [
+                composition.pdf_line
+                for composition in paragraph.pdf_paragraph_composition
+                if composition.pdf_line
+            ]
+            if len(lines) < 3:
+                new_paragraphs.append(paragraph)
+                continue
+            line_groups = self._split_instruction_list_lines(lines)
+            if not line_groups:
+                new_paragraphs.append(paragraph)
+                continue
+
+            for line_group in line_groups:
+                new_paragraph = PdfParagraph(
+                    box=Box(0, 0, 0, 0),
+                    pdf_style=paragraph.pdf_style,
+                    pdf_paragraph_composition=[
+                        PdfParagraphComposition(pdf_line=line)
+                        for line in line_group
+                    ],
+                    unicode="",
+                    scale=paragraph.scale,
+                    optimal_scale=paragraph.optimal_scale,
+                    debug_id=generate_base58_id(),
+                    layout_label=paragraph.layout_label,
+                    layout_id=paragraph.layout_id,
+                    render_order=paragraph.render_order,
+                )
+                self.update_paragraph_data(new_paragraph, update_unicode=True)
+                new_paragraphs.append(new_paragraph)
+
+        paragraphs[:] = new_paragraphs
+
+    def _split_instruction_list_lines(
+        self,
+        lines: list[PdfLine],
+    ) -> list[list[PdfLine]] | None:
+        split_groups: list[list[PdfLine]] = []
+        plain_group: list[PdfLine] = []
+        current_instruction_group: list[PdfLine] | None = None
+        instruction_count = 0
+        first_label_x: float | None = None
+
+        def flush_plain_group():
+            nonlocal plain_group
+            if plain_group:
+                split_groups.append(plain_group)
+                plain_group = []
+
+        for line in lines:
+            text = self._get_line_text(line).strip()
+            is_instruction = self._is_instruction_list_label(text)
+            if is_instruction:
+                flush_plain_group()
+                instruction_count += 1
+                current_instruction_group = [line]
+                split_groups.append(current_instruction_group)
+                if first_label_x is None and line.box:
+                    first_label_x = line.box.x
+                continue
+
+            if (
+                current_instruction_group is not None
+                and line.box
+                and first_label_x is not None
+                and line.box.x > first_label_x + 30
+            ):
+                current_instruction_group.append(line)
+                continue
+
+            current_instruction_group = None
+            plain_group.append(line)
+
+        flush_plain_group()
+
+        if instruction_count < 3:
+            return None
+
+        if (
+            len(split_groups) == 1
+            and len(split_groups[0]) == len(lines)
+        ):
+            return None
+
+        return split_groups
+
+    @staticmethod
     def _has_toc_dot_leader(text: str) -> bool:
         return re.search(r"(?:\.\s*){20,}", text) is not None
 
@@ -1375,6 +1663,20 @@ class ParagraphFinder:
         if len(paragraph.pdf_paragraph_composition) != 1:
             return None
         return paragraph.pdf_paragraph_composition[0].pdf_line
+
+    @staticmethod
+    def _get_first_line(paragraph: PdfParagraph) -> PdfLine | None:
+        for composition in paragraph.pdf_paragraph_composition:
+            if composition.pdf_line:
+                return composition.pdf_line
+        return None
+
+    @staticmethod
+    def _get_last_line(paragraph: PdfParagraph) -> PdfLine | None:
+        for composition in reversed(paragraph.pdf_paragraph_composition):
+            if composition.pdf_line:
+                return composition.pdf_line
+        return None
 
     @staticmethod
     def _char_index_at_text_offset(chars: list[PdfCharacter], offset: int) -> int:
