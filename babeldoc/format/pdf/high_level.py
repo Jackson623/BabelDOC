@@ -172,6 +172,17 @@ def check_metadata(pdf: Document):
 def add_metadata(
     translate_result: TranslateResult, translate_config: TranslationConfig
 ):
+    def normalize_metadata_value(value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return re.sub(r"[\uD800-\uDFFF]", "", value)
+        if isinstance(value, (list, tuple, set)):
+            value = ", ".join(str(item) for item in value if item is not None)
+        else:
+            value = str(value)
+        return re.sub(r"[\uD800-\uDFFF]", "", value)
+
     processed = []
     for attr in (
         "mono_pdf_path",
@@ -189,8 +200,8 @@ def add_metadata(
         meta = pdf.metadata
         if not meta:
             meta = {}
-        creator = meta.get("creator", None)
-        producer = meta.get("producer", None)
+        creator = normalize_metadata_value(meta.get("creator", None))
+        producer = normalize_metadata_value(meta.get("producer", None))
         if producer:
             if not creator:
                 creator = producer
@@ -206,7 +217,7 @@ def add_metadata(
         for k, v in meta.items():
             if v:
                 # 使用正则替换掉 surrogate 范围内的字符
-                meta[k] = re.sub(r"[\uD800-\uDFFF]", "", v)
+                meta[k] = normalize_metadata_value(v)
 
         pdf.set_metadata(meta)
         safe_save(pdf, temp_path)

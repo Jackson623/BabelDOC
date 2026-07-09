@@ -408,7 +408,11 @@ def create_parser():
     service_group.add_argument(
         "--openai-model",
         default="gpt-4o-mini",
-        help="The OpenAI model to use for translation.",
+        help=(
+            "The OpenAI model to use for translation. "
+            "Use comma-separated model names to enable fallback, "
+            "for example: gemini-2.5-flash,gemini-2.5-flash-lite,gpt-4o-mini."
+        ),
     )
     service_group.add_argument(
         "--openai-base-url",

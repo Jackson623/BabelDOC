@@ -21,8 +21,61 @@ from babeldoc.utils.atomic_integer import AtomicInteger
 logger = logging.getLogger(__name__)
 
 
+OPENAI_FALLBACK_ERROR_STATUS_CODES = {402, 429}
+OPENAI_FALLBACK_ERROR_KEYWORDS = (
+    "insufficient_quota",
+    "quota",
+    "quota_exceeded",
+    "rate_limit_exceeded",
+    "resource_exhausted",
+    "too many requests",
+    "billing",
+    "exceeded your current quota",
+    "you exceeded your current quota",
+    "exceeded the rate limit",
+    "rate limit exceeded",
+    "rate_limit",
+)
+
+
 def remove_control_characters(s):
     return "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
+
+
+def parse_openai_model_list(model: str | list[str] | tuple[str, ...]) -> list[str]:
+    if isinstance(model, str):
+        models = [model_part.strip() for model_part in model.split(",")]
+    else:
+        models = [str(model_part).strip() for model_part in model]
+    return [model_part for model_part in models if model_part]
+
+
+def _get_openai_exception_text(exc: Exception) -> str:
+    parts = [str(exc)]
+    for attr in ("message", "code", "type"):
+        value = getattr(exc, attr, None)
+        if value:
+            parts.append(str(value))
+    response = getattr(exc, "response", None)
+    if response is not None:
+        with contextlib.suppress(Exception):
+            parts.append(response.text)
+    body = getattr(exc, "body", None)
+    if body:
+        parts.append(str(body))
+    return " ".join(parts).lower()
+
+
+def is_openai_model_fallback_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code in OPENAI_FALLBACK_ERROR_STATUS_CODES:
+        return True
+
+    error_text = _get_openai_exception_text(exc)
+    if isinstance(exc, openai.RateLimitError):
+        return True
+
+    return any(keyword in error_text for keyword in OPENAI_FALLBACK_ERROR_KEYWORDS)
 
 
 class RateLimiter:
@@ -238,11 +291,17 @@ class OpenAITranslator(BaseTranslator):
         )
         if send_temperature:
             self.add_cache_impact_parameters("temperature", self.options["temperature"])
-        self.model = model
+        self.models = parse_openai_model_list(model)
+        if not self.models:
+            raise ValueError("OpenAI model must not be empty")
+        self._model_lock = threading.Lock()
+        self._model_index = 0
+        self.model = self.models[self._model_index]
+        self.model_chain = ",".join(self.models)
         self.enable_json_mode_if_requested = enable_json_mode_if_requested
         self.send_dashscope_header = send_dashscope_header
         self.send_temperature = send_temperature
-        self.add_cache_impact_parameters("model", self.model)
+        self.add_cache_impact_parameters("model", self.model_chain)
         self.add_cache_impact_parameters("prompt", self.prompt(""))
         if self.reasoning:
             self.extra_body["reasoning"] = {"effort": self.reasoning}
@@ -256,6 +315,45 @@ class OpenAITranslator(BaseTranslator):
         self.completion_token_count = AtomicInteger()
         self.cache_hit_prompt_token_count = AtomicInteger()
 
+    def _get_current_model(self) -> str:
+        with self._model_lock:
+            return self.models[self._model_index]
+
+    def _switch_to_next_model(self, failed_model: str, exc: Exception) -> str | None:
+        with self._model_lock:
+            try:
+                failed_index = self.models.index(failed_model)
+            except ValueError:
+                failed_index = self._model_index
+            if failed_index != self._model_index:
+                return self.models[self._model_index]
+            if self._model_index + 1 >= len(self.models):
+                return None
+            self._model_index += 1
+            self.model = self.models[self._model_index]
+            next_model = self.model
+
+        logger.warning(
+            "OpenAI model '%s' failed with quota/rate-limit style error; "
+            "falling back to '%s'. Error: %s",
+            failed_model,
+            next_model,
+            exc,
+        )
+        return next_model
+
+    def _create_chat_completion_with_fallback(self, **kwargs):
+        while True:
+            model = self._get_current_model()
+            try:
+                return self.client.chat.completions.create(model=model, **kwargs)
+            except Exception as exc:
+                next_model = None
+                if is_openai_model_fallback_error(exc):
+                    next_model = self._switch_to_next_model(model, exc)
+                if next_model is None:
+                    raise
+
     @retry(
         retry=retry_if_exception_type(openai.RateLimitError),
         stop=stop_after_attempt(100),
@@ -267,8 +365,7 @@ class OpenAITranslator(BaseTranslator):
         if self.send_temperature:
             options.update(self.options)
 
-        response = self.client.chat.completions.create(
-            model=self.model,
+        response = self._create_chat_completion_with_fallback(
             **options,
             messages=self.prompt(text),
             extra_body=self.extra_body,
@@ -312,8 +409,7 @@ class OpenAITranslator(BaseTranslator):
                 '{"input": "disable", "output": "disable"}'
             )
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
+            response = self._create_chat_completion_with_fallback(
                 **options,
                 max_tokens=2048,
                 messages=[

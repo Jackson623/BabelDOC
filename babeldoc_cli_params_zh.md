@@ -99,7 +99,7 @@ uv run babeldoc `
 
 | 参数 | 中文名 | 含义 | 默认值/说明 |
 |---|---|---|---|
-| `--openai-model OPENAI_MODEL` | 模型名 | 指定 OpenAI-compatible 接口的模型名称。 | `gpt-4o-mini` |
+| `--openai-model OPENAI_MODEL` | 模型名 | 指定 OpenAI-compatible 接口的模型名称。支持用英文逗号配置多个模型，当前模型触发额度/限流类错误时会自动切换到下一个模型，例如 `gemini-2.5-flash,gemini-2.5-flash-lite,gpt-4o-mini`。 | `gpt-4o-mini` |
 | `--openai-base-url OPENAI_BASE_URL` | 接口地址 | OpenAI-compatible API Base URL。 | 无 |
 | `--openai-api-key OPENAI_API_KEY`, `-k OPENAI_API_KEY` | API Key | OpenAI-compatible API Key。 | 使用 `--openai` 时必填 |
 | `--openai-term-extraction-model OPENAI_TERM_EXTRACTION_MODEL` | 术语提取模型 | 自动术语提取使用的模型。 | 未指定时使用 `--openai-model` |
@@ -116,7 +116,7 @@ uv run babeldoc `
 | 参数 | Gemini 示例值 | 说明 |
 |---|---|---|
 | `--openai` | 启用 | BabelDOC 当前只支持 OpenAI-compatible 翻译器。 |
-| `--openai-model` | `gemini-2.5-flash` | 可按你的额度和质量需求替换为其他 Gemini 模型。 |
+| `--openai-model` | `gemini-2.5-flash,gemini-2.5-flash-lite,gpt-4o-mini` | 可按你的额度和质量需求配置一个或多个模型，多个模型按顺序自动 fallback。 |
 | `--openai-base-url` | `https://generativelanguage.googleapis.com/v1beta/openai/` | Gemini 的 OpenAI-compatible API 地址。 |
 | `--openai-api-key` | `<Gemini API Key>` | Google AI Studio / Gemini API 的 key。 |
 | `--no-send-temperature` | 可选 | 如果某个兼容接口不接受 `temperature`，可加这个参数。 |
@@ -129,7 +129,7 @@ uv run babeldoc `
 [babeldoc]
 files = "D:\\path\\input.pdf"
 openai = true
-openai-model = "gemini-2.5-flash"
+openai-model = "gemini-2.5-flash,gemini-2.5-flash-lite,gpt-4o-mini"
 openai-base-url = "https://generativelanguage.googleapis.com/v1beta/openai/"
 openai-api-key = "your-api-key"
 lang-in = "en"
